@@ -1,4 +1,4 @@
-// Copyright 2023-2024 DreamWorks Animation LLC
+// Copyright 2023-2025 DreamWorks Animation LLC
 // SPDX-License-Identifier: Apache-2.0
 
 #pragma once
@@ -86,10 +86,10 @@ private:
 
     void updateNetIO();
     void recvBpsUpdate(mcrt::ProgressiveFrame::ConstPtr frameMsg);
-    void sendBpsUpdate(size_t messageSerializedByte);
+    void sendBpsUpdate(const size_t messageSerializedByte);
     void piggyBackInfo(std::vector<std::string>& infoDataArray);
     bool decodeMergeSendProgressiveFrame(std::vector<std::string>& infoDataArray);
-    void sendProgressiveFrame(std::vector<std::string>& infoDataArray);
+    void sendProgressiveFrame(mcrt::ProgressiveFrame::Ptr frameMsg, std::vector<std::string>& infoDataArray);
     void sendInfoOnlyProgressiveFrame(std::vector<std::string>& infoDataArray);
     void sendProgressUpdateToMcrt();
     void processFeedback();
@@ -108,8 +108,8 @@ private:
     void showMsg(const std::string& msg, bool cerrOut);
 
     void initFeedbackFbSender();
-    void setFeedbackActive(bool flag);
-    void setFeedbackIntervalSec(float sec);
+    void setFeedbackActive(const bool flag);
+    void setFeedbackIntervalSec(const float sec);
     std::string showFeedbackStats() const;
 
     //------------------------------

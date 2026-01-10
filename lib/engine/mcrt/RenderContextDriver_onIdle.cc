@@ -1,6 +1,5 @@
-// Copyright 2023-2024 DreamWorks Animation LLC
+// Copyright 2023-2025 DreamWorks Animation LLC
 // SPDX-License-Identifier: Apache-2.0
-
 #include "RenderContextDriver.h"
 
 #include <arras4_log/Logger.h> // ARRAS_LOG_INFO
@@ -10,6 +9,7 @@
 #include <mcrt_dataio/share/util/SysUsage.h>
 #include <mcrt_messages/BaseFrame.h>
 #include <moonray/rendering/mcrt_common/ExecutionMode.h>
+#include <moonray/rendering/rndr/PathVisualizerManager.h>
 #include <moonray/rendering/rndr/RenderContext.h>
 #include <moonray/rendering/rndr/TileScheduler.h>
 #include <scene_rdl2/common/rec_time/RecTime.h>
@@ -55,7 +55,7 @@ RenderContextDriver::isEnoughSendInterval(const float fps,
     } else {
         // In a single-machine or multi-machine without dispatchGatesFrame condition,
         // frame gating is handled here.
-        double currentTime = scene_rdl2::util::getSeconds();
+        const double currentTime = scene_rdl2::util::getSeconds();
         if ((currentTime - mLastTimeOfEnoughIntervalForSend) >= (1.0f / fps)) {
             mLastTimeOfEnoughIntervalForSend = currentTime;
             mLastTimeOfEnoughIntervalForHeartBeat = currentTime;
@@ -80,7 +80,7 @@ RenderContextDriver::isEnoughSendIntervalHeartBeat(const float checkFps)
         return false;
     }
 
-    double currentTime = scene_rdl2::util::getSeconds();
+    const double currentTime = scene_rdl2::util::getSeconds();
     if ((currentTime - mLastTimeOfEnoughIntervalForHeartBeat) >= (1.0f / checkFps)) {    
         mLastTimeOfEnoughIntervalForHeartBeat = currentTime;
         return true;
@@ -108,7 +108,7 @@ RenderContextDriver::sendDelta(ProgressiveFrameSendCallBack callBackSend)
     //------------------------------
 
     // Make sure we are able to do a snapshot of the frame buffer.
-    bool isReadyToSnapshot =
+    const bool isReadyToSnapshot =
         mRenderPrepWatcher.isRunStateWait() && // renderPrep completed
         mRenderContext && 
         mRenderContext->isFrameReadyForDisplay() &&
@@ -120,7 +120,7 @@ RenderContextDriver::sendDelta(ProgressiveFrameSendCallBack callBackSend)
 
         const int snapshotFilmActivity = mRenderContext->getFilmActivity();
         bool renderUpdate = (snapshotFilmActivity != mLastSnapshotFilmActivity);
-        bool renderComplete =
+        const bool renderComplete =
             mRenderContext->isFrameRendering() &&
             (mRenderContext->isFrameComplete() || mRenderContext->isFrameCompleteAtPassBoundary());
         if (!renderUpdate && renderComplete && !mSentCompleteFrame) {
@@ -194,8 +194,15 @@ RenderContextDriver::applyUpdatesAndRestartRender(const GetTimingRecFrameCallBac
     if (!renderContext) {
         return;                 // early exit
     }
-    if (mMcrtUpdates.empty() && !mGeometryUpdate) {
-        return;                 // empty updates -> exit
+
+    auto needsPathVisualizerStartSim = [&]() {
+        if (!isPathVisualizerMode()) return false;
+        moonray::rndr::PathVisualizerManager* visMgrObsrPtr = mRenderContext->getPathVisualizerManager().get();
+        return visMgrObsrPtr->isInStartRecordState();
+    };
+
+    if (!needsPathVisualizerStartSim() && mMcrtUpdates.empty() && !mGeometryUpdate) {
+        return; // no need to update the scene and restart render -> exit
     }
 
     // Apply updates if needed but not unless we've sent at least one snapshot
@@ -388,27 +395,27 @@ RenderContextDriver::isReadyToSend(const double now)
     }
 
     if (mInitFrameDelayedSnapshotSec < 0.0f) {
-        double nonDelayRatio =
+        const double nonDelayRatio =
             static_cast<double>(mInitFrameNonDelayedSnapshotMaxNode) /
             static_cast<double>(mNumMachinesOverride);
 
         std::random_device rnd;
         std::mt19937 mt(rnd());
         std::uniform_real_distribution<> rand(0.0, 1.0);
-        double v = rand(mt);
-
+        const double v = rand(mt);
+        
         if (v <= nonDelayRatio) {
             mInitFrameDelayedSnapshotSec = 0.0;
         } else {
-            double maxSec =
+            const double maxSec =
                 mInitFrameDelayedSnapshotStepMS *
                 static_cast<double>(mNumMachinesOverride) / 1000.0;
-            double delayRatio = (v - nonDelayRatio) / (1.0 - nonDelayRatio);
+            const double delayRatio = (v - nonDelayRatio) / (1.0 - nonDelayRatio);
             mInitFrameDelayedSnapshotSec = delayRatio * maxSec;
         }
     }
 
-    double intervalSec = now - mInitialSnapshotReadyTime;
+    const double intervalSec = now - mInitialSnapshotReadyTime;
     return mInitFrameDelayedSnapshotSec <= intervalSec;
 }
 
@@ -470,6 +477,57 @@ RenderContextDriver::sendProgressiveFrameMessage(const bool directToClient,
                             },
                             coarsePass);
     if (mTimingRecFrame) mTimingRecFrame->setSnapshotEndTiming();
+
+    //------------------------------
+
+    size_t vecDataSize = 0;
+    if (isPathVisualizerMode()) {
+        if (mPathVisRenderCounterLastUpdate < mRenderCounter) {
+            //
+            // We only send vecPacket info if a new render started.
+            //
+            mPathVisRenderCounterLastUpdate = mRenderCounter;
+
+            unsigned currTotalLines = mRenderContext->getPathVisualizerManager().get()->getTotalLines();
+            bool needToSendSimGlobalInfo = false;
+            if (mPathVisSimModeCounterLastUpdate < mPathVisSimModeCounter) {
+                // This is a situation of reconstruction of new sim data. We have to send simGlobalInfo as well.
+                needToSendSimGlobalInfo = true;
+                mPathVisSimModeCounterLastUpdate = mPathVisSimModeCounter;
+                mPathVisLastSentTotalLines = currTotalLines;
+            } else {
+                if (currTotalLines > 0) {
+                    mPathVisLastSentTotalLines = currTotalLines;
+                } else {
+                    if (mPathVisLastSentTotalLines > 0 && currTotalLines == 0) {
+                        // This is a special case. we have to update empty lines info to the client.
+                        needToSendSimGlobalInfo = true;                    
+                        mPathVisLastSentTotalLines = currTotalLines; 
+                    }
+                }
+            }
+
+            vecDataSize =
+                mVecSender.snapshotDrawing
+                (mFbSender.getWidth(),
+                 mFbSender.getHeight(),
+                 static_cast<unsigned>(mRenderCounter), // renderStart counter from process started
+                 mSnapshotId, // snapshot id from renderStart, reset to 0 when restart 
+                 *mRenderContext,
+                 needToSendSimGlobalInfo);
+        }
+
+    } else {
+        auto needToSendPathVisTurnOff = [&]() { // find previous condition is ON and current condition if OFF.
+            if (isPathVisualizerMode()) return false; // current condition is ON
+            if (mVecSender.compareDictPathVisActive(false)) return false; // previous condition is OFF
+            return true; // previous condition is ON or unknown
+        };
+
+        if (needToSendPathVisTurnOff()) {
+            vecDataSize = mVecSender.snapshotPathVisualizerDisable(); // only send pathVis off dictionary packet
+        }
+    }
 
     //------------------------------
 
@@ -594,6 +652,22 @@ RenderContextDriver::sendProgressiveFrameMessage(const bool directToClient,
             (infoDataArray,
              [&](const DataPtr &data, const size_t dataSize, const char *aovName, const EncodingType enco) {
                 frameMsg->addBuffer(data, dataSize, aovName, encoTypeConvert(enco));
+                dataSizeTotal += dataSize;
+            });
+    }
+
+    //------------------------------
+
+    if (vecDataSize) {
+        mVecSender.addVecPacketToProgressiveFrame
+            ([&](const DataPtr& data, const size_t dataSize, const char *buffName) {
+                /* for debug
+                std::cerr << ">> RenderContextDriver_onIdle.cc sendProgressiveFrameMessage()"
+                          << " buffname:" << buffName
+                          << " data:0x" << std::hex << (uintptr_t)(data.get()) << std::dec
+                          << " dataSize:" << dataSize << '\n';
+                */
+                frameMsg->addBuffer(data, dataSize, buffName, mcrt::BaseFrame::ENCODING_UNKNOWN);
                 dataSizeTotal += dataSize;
             });
     }
@@ -725,6 +799,8 @@ RenderContextDriver::updateInfoData(std::vector<std::string>& infoDataArray)
         updateExecModeMcrtNodeInfo();
     }
 
+    updateOrbitCamAutoFocusPoint();
+
     if (mMcrtNodeInfoMapItem.encode(infoData)) {
         infoDataArray.push_back(std::move(infoData));
     }
@@ -763,6 +839,26 @@ RenderContextDriver::updateNetIO()
 }
 
 void
+RenderContextDriver::updateOrbitCamAutoFocusPoint()
+{
+    if (mOrbitCamAutoFocusPointLastSent == mOrbitCamAutoFocusPoint) return; // skip sending
+
+    // orbit cam auto focus point has been updated.
+    mcrt_dataio::McrtNodeInfo &mcrtNodeInfo = mMcrtNodeInfoMapItem.getMcrtNodeInfo();
+    mcrtNodeInfo.setOrbitCamAutoFocusPoint(mOrbitCamAutoFocusPoint);
+    mOrbitCamAutoFocusPointLastSent = mOrbitCamAutoFocusPoint;
+
+    /* for debug
+    std::cerr << ">> RenderContextDriver_onIdle.cc updateOrbitCamAutoFocusPoint() {\n"
+              << "  mOrbitCamAutoFocusPoint:"
+              << mOrbitCamAutoFocusPoint[0] << ", "
+              << mOrbitCamAutoFocusPoint[1] << ", "
+              << mOrbitCamAutoFocusPoint[2] << '\n'
+              << "}\n";
+    */
+}
+
+void
 RenderContextDriver::piggyBackStatsInfo(std::vector<std::string>& infoDataArray)
 {
     if (mSnapshotToSendTimeLog->getTotal() > 24) {
@@ -783,20 +879,20 @@ RenderContextDriver::piggyBackStatsInfo(std::vector<std::string>& infoDataArray)
         std::lock_guard<std::mutex> lock(mMutexMcrtNodeInfoMapItem);
         mcrt_dataio::McrtNodeInfo &mcrtNodeInfo = mMcrtNodeInfoMapItem.getMcrtNodeInfo();
         
-        float sendBps = mSendBandwidthTracker.getBps(); // Byte/Sec
+        const float sendBps = mSendBandwidthTracker.getBps(); // Byte/Sec
         mcrtNodeInfo.setSendBps(sendBps); // update outgoing bandwidth
 
-        bool feedbackActive = mFeedbackActiveRuntime;
+        const bool feedbackActive = mFeedbackActiveRuntime;
         mcrtNodeInfo.setFeedbackActive(feedbackActive);
         if (feedbackActive) {
             // We only update feedback related info when feedback is active
-            float feedbackInterval = mFeedbackIntervalSec;
-            float recvFeedbackBps =
+            const float feedbackInterval = mFeedbackIntervalSec;
+            const float recvFeedbackBps =
                 (mRecvFeedbackBandwidthTracker) ? mRecvFeedbackBandwidthTracker->getBps() : 0.0f; // Byte/Sec
-            float recvFeedbackFps =
+            const float recvFeedbackFps =
                 (mRecvFeedbackFpsTracker) ? mRecvFeedbackFpsTracker->getFps() : 0.0f; // fps
-            float feedbackEvalLogSec = mFeedbackEvalLog.getAvg(); // millisec
-            float feedbackLatencySec = mFeedbackLatency.getAvg(); // millisec
+            const float feedbackEvalLogSec = mFeedbackEvalLog.getAvg(); // millisec
+            const float feedbackLatencySec = mFeedbackLatency.getAvg(); // millisec
             mcrtNodeInfo.setFeedbackInterval(feedbackInterval); // sec
             mcrtNodeInfo.setRecvFeedbackFps(recvFeedbackFps); // update incoming feedback fps
             mcrtNodeInfo.setRecvFeedbackBps(recvFeedbackBps); // update incoming feedback bandwidth
@@ -844,7 +940,7 @@ RenderContextDriver::piggyBackTimingRec(std::vector<std::string> &infoDataArray)
 }
 
 mcrt::BaseFrame::ImageEncoding
-RenderContextDriver::encoTypeConvert(moonray::engine_tool::ImgEncodingType enco) const
+RenderContextDriver::encoTypeConvert(const moonray::engine_tool::ImgEncodingType enco) const
 {
     mcrt::BaseFrame::ImageEncoding encoType = mcrt::BaseFrame::ENCODING_UNKNOWN;
     switch (enco) {
@@ -916,6 +1012,51 @@ RenderContextDriver::applyConfigOverrides()
         // disable snapshot action for interruption by signal
         sceneVars.set(scene_rdl2::rdl2::SceneVariables::sCheckpointSnapshotInterval, 0.0f);
         sceneVars.set(scene_rdl2::rdl2::SceneVariables::sCheckpointMaxSnapshotOverhead, 0.0f);
+    }
+}
+
+void
+RenderContextDriver::revertRenderMode()
+{
+    mRenderOptions.setRenderMode(mLastRenderModeBeforeSimStage);
+    /* for debug
+    std::cerr << ">> RenderContextDriver_onIdle.cc revertRenderMode() to "
+              << showRenderMode(mRenderOptions.getRenderMode()) << '\n';
+    */
+}
+
+// static function
+std::string
+RenderContextDriver::showMat4f(const scene_rdl2::math::Mat4f& mtx)
+{
+    auto showV = [](const int i, const int j, const float v) {
+        std::ostringstream ostr;
+        ostr << i << ':' << j << "(" << std::setw(10) << std::fixed << std::setprecision(5) << v << ")";
+        return ostr.str();
+    };
+
+    std::ostringstream ostr;
+    ostr << "Mat4f {\n";
+    for (int i = 0; i < 4; ++i) {
+        ostr << "  "
+             << showV(i, 0, mtx[i][0]) << ' ' << showV(i, 1, mtx[i][1]) << ' '
+             << showV(i, 2, mtx[i][2]) << ' ' << showV(i, 3, mtx[i][3]) << '\n';
+    }
+    ostr << "}";
+    return ostr.str();
+}
+
+// static function
+std::string
+RenderContextDriver::showRenderMode(const moonray::rndr::RenderMode mode)
+{
+    switch (mode) {
+    case moonray::rndr::RenderMode::BATCH : return "BATCH";
+    case moonray::rndr::RenderMode::PROGRESSIVE : return "PROGRESSIVE";
+    case moonray::rndr::RenderMode::PROGRESSIVE_FAST : return "PROGRESSIVE_FAST";
+    case moonray::rndr::RenderMode::REALTIME : return "REALTIME";
+    case moonray::rndr::RenderMode::PROGRESS_CHECKPOINT : return "PROGRESS_CHECKPOINT";
+    default : return "?";
     }
 }
 

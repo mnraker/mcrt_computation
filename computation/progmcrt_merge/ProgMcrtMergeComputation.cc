@@ -1,6 +1,5 @@
-// Copyright 2023-2024 DreamWorks Animation LLC
+// Copyright 2023-2025 DreamWorks Animation LLC
 // SPDX-License-Identifier: Apache-2.0
-
 #include "ProgMcrtMergeComputation.h"
 #include "ProgMcrtMergeClockDeltaDriver.h"
 
@@ -182,7 +181,7 @@ ProgMcrtMergeComputation::onStart()
     mFbMsgMultiFrames.reset(new mcrt_dataio::FbMsgMultiFrames(&mGlobalNodeInfo, &mFeedbackActive));
     mFbMsgMultiFrames->setTunnelMachineIdInfo(&mTunnelMachineId);
 
-    int totalCacheFrames = 2;
+    const int totalCacheFrames = 2;
     if (!mFbMsgMultiFrames->initTotalCacheFrames(totalCacheFrames) ||
         !mFbMsgMultiFrames->initNumMachines(mNumMachines)) {
 #       ifdef DEVELOP_VER_MESSAGE
@@ -241,8 +240,8 @@ ProgMcrtMergeComputation::onIdle()
     bool doSendInfo = false;
     {
         // We have to respect user-defined fps intervals for info as well.
-        double currInterval = scene_rdl2::util::getSeconds() - mLastInfoPacketSentTime;
-        double minInterval = 1.0 / static_cast<double>(mFps);
+        const double currInterval = scene_rdl2::util::getSeconds() - mLastInfoPacketSentTime;
+        const double minInterval = 1.0 / static_cast<double>(mFps);
         if (minInterval <= currInterval) {
             if (mSysUsage.isCpuUsageReady()) {
                 //
@@ -357,7 +356,7 @@ ProgMcrtMergeComputation::onMessage(const arras4::api::Message& aMsg)
 
             if (quickUpdate) {
                 onViewportChanged(*progressive);
-                double now = scene_rdl2::util::getSeconds();
+                const double now = scene_rdl2::util::getSeconds();
                 if (forceUpdate || (now - mLastPacketSentTime) > 1.0 / static_cast<double>(mFps)) {
                     //
                     // We received a new syncId message and also it is enough interval from previous send.
@@ -521,7 +520,7 @@ ProgMcrtMergeComputation::sendCompleteToMcrt()
     // multiplex pixel distribution mode
     //
 
-    float fraction = mFbSender.getProgressFraction();
+    const float fraction = mFbSender.getProgressFraction();
     if (fraction < 1.0f) {
         return;                 // not completed yet.
     }
@@ -531,7 +530,7 @@ ProgMcrtMergeComputation::sendCompleteToMcrt()
     // So we send completeFrame message to the McrtComputation and try to stop them
     // by using "stop at pass boundary" logic.
     //
-    uint32_t syncId = mFbMsgMultiFrames->getDisplaySyncFrameId();
+    const uint32_t syncId = mFbMsgMultiFrames->getDisplaySyncFrameId();
     if (mLastCompleteSyncId == syncId) {
         return;                 // already sent complete message
     }
@@ -588,8 +587,8 @@ ProgMcrtMergeComputation::decodeMergeSendProgressiveFrame(std::vector<std::strin
     // decode
     //
     if (mFbMsgMultiFrames->getDisplayFbMsgSingleFrame()->getStatus() == mcrt::BaseFrame::RENDERING) {
-        double currInterval = scene_rdl2::util::getSeconds() - mLastPacketSentTime;
-        double minInterval = 1.0 / static_cast<double>(mFps);
+        const double currInterval = scene_rdl2::util::getSeconds() - mLastPacketSentTime;
+        const double minInterval = 1.0 / static_cast<double>(mFps);
         if (currInterval < minInterval) {
             if (infoDataArray.size()) {
                 sendInfoOnlyProgressiveFrame(infoDataArray);
@@ -637,6 +636,25 @@ ProgMcrtMergeComputation::decodeMergeSendProgressiveFrame(std::vector<std::strin
         // create encoded upstreamLatencyLog data inside fbSender
         mFbSender.encodeUpstreamLatencyLog(currFbMsgSingleFrame);
     }
+
+    mcrt::ProgressiveFrame::Ptr frameMsg = nullptr;
+    frameMsg.reset(new mcrt::ProgressiveFrame);
+    if (currFbMsgSingleFrame->hasVecPacket()) {
+        //
+        // We generate vectorPacket first because we need to setup all vecPacket data before clean up
+        // the internal data by resetLastHistory().
+        //
+        using DataPtr = std::shared_ptr<uint8_t>;
+        currFbMsgSingleFrame->encodeVecPacket([&](const std::string& buffName,
+                                                  DataPtr dataPtr,
+                                                  const size_t dataSize) { 
+            frameMsg->addBuffer(dataPtr,
+                                dataSize,
+                                buffName.c_str(),
+                                mcrt::BaseFrame::ENCODING_UNKNOWN);
+        });
+    }
+
     mFbSender.timeLogEnq(scene_rdl2::grid_util::LatencyItem::Key::MERGE_UPSTREAM_LATENCYLOG_END); {
         currFbMsgSingleFrame->resetLastHistory();
     }
@@ -656,7 +674,7 @@ ProgMcrtMergeComputation::decodeMergeSendProgressiveFrame(std::vector<std::strin
     mFbSender.timeLogEnq(scene_rdl2::grid_util::LatencyItem::Key::MERGE_SNAPSHOT_END);
 
     sendCompleteToMcrt();
-    sendProgressiveFrame(infoDataArray); // send ProgressiveFrame message to downstream
+    sendProgressiveFrame(frameMsg, infoDataArray); // send ProgressiveFrame message to downstream 
     mFbSender.timeLogReset();
 
     mLastPacketSentTime = scene_rdl2::util::getSeconds();
@@ -678,14 +696,12 @@ ProgMcrtMergeComputation::decodeMergeSendProgressiveFrame(std::vector<std::strin
 }
 
 void
-ProgMcrtMergeComputation::sendProgressiveFrame(std::vector<std::string>& infoDataArray)
+ProgMcrtMergeComputation::sendProgressiveFrame(mcrt::ProgressiveFrame::Ptr frameMsg,
+                                               std::vector<std::string>& infoDataArray)
 {
     piggyBackInfo(infoDataArray);
 
     //------------------------------
-
-    mcrt::ProgressiveFrame::Ptr frameMsg = nullptr;
-    frameMsg.reset(new mcrt::ProgressiveFrame);
 
     frameMsg->mMachineId = -2; // indicates merge computation node
     frameMsg->mHeader.mRezedViewport.setViewport(mRezedViewport.mMinX, mRezedViewport.mMinY,
@@ -745,6 +761,9 @@ ProgMcrtMergeComputation::sendProgressiveFrame(std::vector<std::string>& infoDat
     //------------------------------
 
     ARRAS_LOG_DEBUG("Sending ProgressiveFrame");
+    // The following loop sends multiple copies of the message for bandwidth stress testing.
+    // In production, mSendDup should be set to 1 (no duplication).
+    // For testing/debugging, mSendDup can be increased to simulate higher bandwidth usage.
     for (int i = 0; i < mSendDup; ++i) {
         sendBpsUpdate(frameMsg->serializedLength());
         send(frameMsg, arras4::api::withSource(mSource));
@@ -822,9 +841,9 @@ ProgMcrtMergeComputation::sendProgressUpdateToMcrt()
     if (mSendProgressToMcrtTime.end() < mSendProgressToMcrtIntervalSec) {
         return;
     }
-
-    uint32_t syncId = mFbMsgMultiFrames->getDisplaySyncFrameId();
-    float fraction = mFbSender.getProgressFraction();
+    
+    const uint32_t syncId = mFbMsgMultiFrames->getDisplaySyncFrameId();
+    const float fraction = mFbSender.getProgressFraction();
 
     mcrt::GenericMessage::Ptr globalProgressMsg(new mcrt::GenericMessage);
     globalProgressMsg->mValue = mcrt_dataio::McrtControl::msgGen_globalProgress(syncId, fraction);
@@ -846,7 +865,7 @@ ProgMcrtMergeComputation::processFeedback()
     scene_rdl2::rec_time::RecTime recTimeEvalFeedback;
     recTimeEvalFeedback.start();
 
-    uint32_t currSyncId = mFbMsgMultiFrames->getDisplaySyncFrameId();
+    const uint32_t currSyncId = mFbMsgMultiFrames->getDisplaySyncFrameId();
 
     //------------------------------
     //
@@ -1006,7 +1025,7 @@ ProgMcrtMergeComputation::recvBpsUpdate(mcrt::ProgressiveFrame::ConstPtr frameMs
 }
 
 void
-ProgMcrtMergeComputation::sendBpsUpdate(size_t messageSerializedByte)
+ProgMcrtMergeComputation::sendBpsUpdate(const size_t messageSerializedByte)
 {
     mSendBandwidthTracker.set(messageSerializedByte);
 }
@@ -1305,13 +1324,13 @@ ProgMcrtMergeComputation::initFeedbackFbSender()
 }
 
 void
-ProgMcrtMergeComputation::setFeedbackActive(bool flag)
+ProgMcrtMergeComputation::setFeedbackActive(const bool flag)
 {
     mFeedbackActive = flag;
 }
 
 void
-ProgMcrtMergeComputation::setFeedbackIntervalSec(float sec)
+ProgMcrtMergeComputation::setFeedbackIntervalSec(const float sec)
 {
     mFeedbackIntervalSec = sec;
 }

@@ -1,6 +1,5 @@
-// Copyright 2023-2024 DreamWorks Animation LLC
+// Copyright 2023-2025 DreamWorks Animation LLC
 // SPDX-License-Identifier: Apache-2.0
-
 #pragma once
 
 #include <mcrt_computation/engine/mcrt/RenderContextDriverManager.h>
@@ -45,6 +44,8 @@ private:
     void handleGenericMessage(mcrt::GenericMessage::ConstPtr jm);
     void onJSONMessage(const arras4::api::Message& msg);
     void onCreditUpdate(const arras4::api::Message& msg);
+    arras4::api::Result onMessageMain(const arras4::api::Message& msg);
+    void processDeferredMessage();
 
     void parserConfigureGenericMessage();
 
@@ -52,6 +53,13 @@ private:
     void sendProgressMessageStageShading(const mcrt::BaseFrame::Status& status,
                                          const float progress,
                                          const std::string& source);
+
+    //------------------------------
+    // This is used for the implementation of "ForceRenderStart" message.
+    // Please see the comment of CallBackForceRenderStart of mcrt_dataio/lib/engine/mcrt/McrtControl.h
+    // for more details.
+    bool mOnMessageCache {false};
+    std::queue<std::shared_ptr<arras4::api::Message>> mDeferredMsgQueue; // First come first serve queue
 
     //------------------------------
 

@@ -59,7 +59,7 @@ RenderContextDriver::evalProgressiveFeedbackMessage(const arras4::api::Message& 
                   << " decodeMergeActionTracker() failed. RuntimeError:" << e.what() << '\n';
     }
 
-    float sec = recTimeEvalFeedbackMessage.end();
+    const float sec = recTimeEvalFeedbackMessage.end();
     mFeedbackEvalLog.set(sec * 1000.0f); // millisec
 
     if (mMcrtDebugFeedback && mMcrtDebugFeedback->isActive()) {
@@ -68,13 +68,13 @@ RenderContextDriver::evalProgressiveFeedbackMessage(const arras4::api::Message& 
 }
 
 void
-RenderContextDriver::setFeedbackActive(bool flag)
+RenderContextDriver::setFeedbackActive(const bool flag)
 {
     mFeedbackActiveUserInput = flag;
 }
 
 void
-RenderContextDriver::setFeedbackIntervalSec(float sec)
+RenderContextDriver::setFeedbackIntervalSec(const float sec)
 {
     mFeedbackIntervalSec = sec;
 }

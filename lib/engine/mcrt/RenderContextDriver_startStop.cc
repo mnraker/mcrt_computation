@@ -1,4 +1,4 @@
-// Copyright 2023-2024 DreamWorks Animation LLC
+// Copyright 2023-2025 DreamWorks Animation LLC
 // SPDX-License-Identifier: Apache-2.0
 
 #include "RenderContextDriver.h"
@@ -7,6 +7,7 @@
 #include <mcrt_dataio/share/util/BandwidthTracker.h>
 #include <mcrt_dataio/share/util/SysUsage.h>
 #include <message_api/Address.h>
+#include <moonray/rendering/rndr/PathVisualizerManager.h>
 #include <moonray/rendering/rndr/RenderContext.h>
 
 //#define DEBUG_LOG_MESSAGE
@@ -48,6 +49,22 @@ RenderContextDriver::startFrame()
             std::lock_guard<std::mutex> lock(mMutexMcrtNodeInfoMapItem);            
             mcrt_dataio::McrtNodeInfo &mcrtNodeInfo = mMcrtNodeInfoMapItem.getMcrtNodeInfo();
             mcrtNodeInfo.setRenderPrepStats(rPrepStats);
+
+            if (rPrepStats.isCompleted()) {
+                if (mGenLineCondition == PathVisGenLineCondition::WAIT_RENDERPREP_FINISHED) {
+                    mGenLineCondition = PathVisGenLineCondition::RUN_GENLINE;
+                }
+
+                scene_rdl2::math::Vec3f focusPoint;
+                if (computeOrbitCamAutoFocusPoint(focusPoint)) {
+                    /* for debug
+                    std::cerr << ">> RenderContextDriver_startStop.cc updateOrbitCamAutoFocusPoint() {\n"
+                              << "  focusPoint:" << focusPoint[0] << ", " << focusPoint[1] << ", " << focusPoint[2] << '\n'
+                              << "}\n";
+                    */
+                    mOrbitCamAutoFocusPoint = focusPoint;
+                }
+            }
         },
         [&]() -> bool {
             return (*mRenderPrepCancel); // true:cancel_renderPrep false:not_cancel
@@ -55,7 +72,35 @@ RenderContextDriver::startFrame()
 
     if (mTimingRecFrame) mTimingRecFrame->setRenderPrepStartTiming();
 
+    if (isPathVisualizerMode()) {
+        moonray::rndr::PathVisualizerManager* visMgrObsrPtr = mRenderContext->getPathVisualizerManager().get();
+        if (visMgrObsrPtr->isInStartRecordState()) { // request simulation mode rendering 
+            // We need to change Path Visualizer's state to RECORD before waking up the Renderprep thread.
+            visMgrObsrPtr->setRecordState();
+        }
+    }
+
     start(); // renderContextDriver thread executes renderPrep and fbSender setup
+}
+
+bool
+RenderContextDriver::computeOrbitCamAutoFocusPoint(scene_rdl2::math::Vec3f& focusPoint)
+{
+    const scene_rdl2::math::HalfOpenViewport vp = getRenderContext()->getRezedRegionWindow();
+    const int centerX = vp.width() / 2;
+    const int centerY = vp.height() / 2;
+
+    // must use offset between center point of aperture window and center point
+    // of region window so that the region window is centered on the pick point.
+    const scene_rdl2::math::HalfOpenViewport avp = getRenderContext()->getRezedApertureWindow();
+    const scene_rdl2::math::HalfOpenViewport rvp = getRenderContext()->getRezedRegionWindow();
+    const int offsetX = (avp.max().x + avp.min().x) / 2 - (rvp.max().x + rvp.min().x) / 2;
+    const int offsetY = (avp.max().y + avp.min().y) / 2 - (rvp.max().y + rvp.min().y) / 2;
+
+    if (!getRenderContext()->handlePickLocation(centerX + offsetX, centerY - offsetY, &focusPoint)) {
+        return false; // no hit
+    }
+    return true;
 }
 
 bool
@@ -105,7 +150,7 @@ RenderContextDriver::stopFrame()
 }
 
 void
-RenderContextDriver::requestStopAtPassBoundary(uint32_t syncId)
+RenderContextDriver::requestStopAtPassBoundary(const uint32_t syncId)
 {
     if (mSyncId != syncId || !mRenderContext) return; // early exit
 

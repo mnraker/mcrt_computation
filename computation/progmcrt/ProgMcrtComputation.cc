@@ -1,6 +1,5 @@
-// Copyright 2023-2024 DreamWorks Animation LLC
+// Copyright 2023-2025 DreamWorks Animation LLC
 // SPDX-License-Identifier: Apache-2.0
-
 #include "ProgMcrtComputation.h"
 
 #include <arras4_log/LogEventStream.h>
@@ -12,6 +11,7 @@
 #include <mcrt_messages/RDLMessage_LeftEye.h>
 #include <mcrt_messages/RDLMessage_RightEye.h>
 #include <mcrt_messages/ViewportMessage.h>
+#include <moonray/rendering/rndr/PathVisualizerManager.h>
 #include <moonray/rendering/rndr/RenderContext.h>
 #include <scene_rdl2/render/util/StrUtil.h>
 
@@ -352,30 +352,55 @@ ProgMcrtComputation::onIdle()
     // RenderContextDriverManager can support multiple renderContextDriver. However at this moment,
     // we only use primary renderContextDriver (i.e. driverId = 0).
     RenderContextDriver* driver = mRenderContextDriverManager->getDriver(0);
+
+    if (driver->isPathVisualizerMode()) {
+        //
+        // Special operation for PathVisualizer
+        //
+        moonray::rndr::PathVisualizerManager* visMgrObsrPtr = driver->getRenderContext()->getPathVisualizerManager().get();
+        if (visMgrObsrPtr->isInRecordState()) {
+            return; // We are still middle of the PathVisualizer simulation stage.
+        } 
+        if (visMgrObsrPtr->isInStopRecordState()) { // We've finished PathVisualizer simulation stage.
+            driver->stopFramePublic(); // update render condition to STOP
+            driver->revertRenderMode(); // revert renderMode to previous mode
+            visMgrObsrPtr->requestDraw(); // set internal condition to REQUEST_DRAW
+            driver->startFramePublic(); // start regular rendering 
+        }
+        if (driver->needToRunGenLine()) { // We generate lines by arras-main-thread
+            visMgrObsrPtr->generateLines(); // internal condition updated GENERATE_LINES -> DRAW
+            driver->resetGenLine(); // reset generateLine condition
+        }
+    }
+
     if (!driver->isEnoughSendInterval(mFps, mDispatchGatesFrame)) {
         return; // Interval-wise, we are not ready to send data
     }
 
     if (mCredit != 0) {
         driver->sendDelta([&](mcrt::ProgressiveFrame::Ptr msg, const std::string& source) {
-                              // send progressiveFrame message with delta image and statistical info
-                              // and also send progress message
-                              sendProgressMessageStageShading(msg->mHeader.mStatus,
-                                                              msg->mHeader.mProgress,
-                                                              source);
+            // send progressiveFrame message with delta image and statistical info
+            // and also send progress message
+            sendProgressMessageStageShading(msg->mHeader.mStatus,
+                                            msg->mHeader.mProgress,
+                                            source);
 
-                              send(msg, arras4::api::withSource(source));
-                              if (mCredit > 0) mCredit--;
+            send(msg, arras4::api::withSource(source));
+            if (mCredit > 0) mCredit--;
 
-                              if (msg->mHeader.mStatus == mcrt::BaseFrame::Status::FINISHED) {
-                                  if (mRecLoad) mRecLoad->stopLog(); // CPU load logger stop
-                              }
-                          });
+            if (msg->mHeader.mStatus == mcrt::BaseFrame::Status::FINISHED) {
+                if (mRecLoad) mRecLoad->stopLog(); // CPU load logger stop
+            }
+
+            if (mOnMessageCache) {
+                processDeferredMessage(); // mOnMessageCache condition is updated inside
+            }
+        });
     }
 
     driver->applyUpdatesAndRestartRender([&]() -> TimingRecorder::TimingRecorderSingleFrameShPtr {
-            return mTimingRecorder.newFrame();
-        });
+        return mTimingRecorder.newFrame();
+    });
 }
 
 void
@@ -412,7 +437,7 @@ ProgMcrtComputation::sendProgressMessageStageShading(const mcrt::BaseFrame::Stat
                                                      const float progress,
                                                      const std::string& source)
 {
-    std::string stage = "shading";
+    const std::string stage = "shading";
     std::string event = "";
     switch (status) {
     case mcrt::BaseFrame::Status::STARTED   : event = "start";    break;
@@ -420,7 +445,7 @@ ProgMcrtComputation::sendProgressMessageStageShading(const mcrt::BaseFrame::Stat
     case mcrt::BaseFrame::Status::FINISHED  : event = "complete"; break;
     default : break;
     }
-    int traceLevel = (event == "pending") ? 1 : 0;
+    const int traceLevel = (event == "pending") ? 1 : 0;
     
     mcrt::ProgressMessage::Ptr msg(new mcrt::ProgressMessage);
     msg->object()["computationType"] = "progmcrt";
@@ -443,8 +468,19 @@ ProgMcrtComputation::sendProgressMessageStageShading(const mcrt::BaseFrame::Stat
 arras4::api::Result
 ProgMcrtComputation::onMessage(const arras4::api::Message& aMsg)
 {
-    if (aMsg.classId() != mcrt::CreditUpdate::ID ||
-        mLogDebug_creditUpdateMessage) {
+    if (mOnMessageCache) {
+        mDeferredMsgQueue.push(std::make_shared<arras4::api::Message>(aMsg));
+        ARRAS_LOG_DEBUG(">> ProgMcrtComputation.cc onMessage ===>> deferredMsgCache ON <<===");
+        return arras4::api::Result::Success;
+    }
+
+    return onMessageMain(aMsg);
+}
+
+arras4::api::Result
+ProgMcrtComputation::onMessageMain(const arras4::api::Message& aMsg)
+{
+    if (aMsg.classId() != mcrt::CreditUpdate::ID || mLogDebug_creditUpdateMessage) {
         ARRAS_LOG_DEBUG("MCRT received message: %s", aMsg.describe().c_str());
     }
 
@@ -497,6 +533,39 @@ ProgMcrtComputation::onMessage(const arras4::api::Message& aMsg)
 }
 
 void
+ProgMcrtComputation::processDeferredMessage()
+{
+    // std::cerr << ">> ProgMcrtComputation.cc - - - - - - deferredMessage processed - - - - - -\n"; // for debug
+
+    mOnMessageCache = false; // We fall back to onMessage cache off mode
+
+    while (!mDeferredMsgQueue.empty()) {
+        std::shared_ptr<arras4::api::Message> msgPtr = mDeferredMsgQueue.front();
+        if (onMessageMain(*msgPtr) == arras4::api::Result::Success) {
+            // RenderContextDriverManager can support multiple renderContextDriver. However at this moment,
+            // we only use primary renderContextDriver (i.e. driverId = 0).
+            RenderContextDriver* driver = mRenderContextDriverManager->getDriver(0);
+
+            // We already know some updates are backlogged and we want to stop current render
+            // as soon as possible. However stop render involves blocking operation like busy
+            // wait loop for finish all MCRT threads and this is timing wise costly.
+            // So first of all, we set requestStop() call here (this is not a blocking call)
+            // There is some chance that all MCRT threads can be stopped during send.
+            driver->getRenderContext()->requestStop();
+        }
+        mDeferredMsgQueue.pop();
+
+        if (mOnMessageCache) {
+            // Backed to the onMessage cache mode. This happens if the latest processed message
+            // was forceRenderStart.
+            // std::cerr << ">> ProgMcrtComputation.cc - - - - - - >>> back to deferred mode <<< - - - - - -\n"; // for debug
+            return;
+        }
+    }
+    // std::cerr << ">> ProgMcrtComputation.cc - - - - - - deferredMessage processed ALL - - - - - -\n"; // for debug
+}
+
+void
 ProgMcrtComputation::parserConfigureGenericMessage()
 {
     Parser& parser = mParserGenericMessage;
@@ -542,7 +611,7 @@ ProgMcrtComputation::handleGenericMessage(mcrt::GenericMessage::ConstPtr msg)
         //
         if (mcrtControl.
             run(msg->mValue,
-                [&](uint32_t currSyncId) { // callBackRenderCompleteProcedure()
+                [&](uint32_t currSyncId) { // bool callBackRenderCompleteProcedure()
                     // RenderContextDriverManager can support multiple renderContextDriver in order to
                     // quickly test multi-renderContext driver configuration for the future plan.
                     // However at this moment, we only use primary renderContextDriver (i.e. driverId = 0).
@@ -550,13 +619,16 @@ ProgMcrtComputation::handleGenericMessage(mcrt::GenericMessage::ConstPtr msg)
                     driver->evalRenderCompleteMultiMachine(currSyncId);
                     return true;
                 },
-                [&](uint32_t currSyncId, float fraction) { // callBackGlobalProgressUpdate()
+                [&](uint32_t currSyncId, float fraction) { // void callBackGlobalProgressUpdate()
                     // RenderContextDriverManager can support multiple renderContextDriver in order to
                     // quickly test multi-renderContext driver configuration for the future plan.
                     // However at this moment, we only use primary renderContextDriver (i.e. driverId = 0).
                     RenderContextDriver *driver = mRenderContextDriverManager->getDriver(0);
                     driver->evalMultiMachineGlobalProgressUpdate(currSyncId, fraction);
-                    return true;
+                },
+                [&]() { // void callBackForceRenderStart()
+                    mOnMessageCache = true;
+                    // std::cerr << ">> ProgMcrtComputation.cc mOnMessageCache=ON\n"; // for debug
                 })) {
             // processed McrtControl command w/ OK condition
         } else {

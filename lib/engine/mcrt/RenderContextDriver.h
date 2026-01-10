@@ -1,6 +1,5 @@
-// Copyright 2023-2024 DreamWorks Animation LLC
+// Copyright 2023-2025 DreamWorks Animation LLC
 // SPDX-License-Identifier: Apache-2.0
-
 #pragma once
 
 #include "DeltaImageCache.h"
@@ -22,14 +21,18 @@
 #include <mcrt_messages/RenderMessages.h>
 #include <message_api/messageapi_types.h>
 #include <moonray/grid/engine_tool/McrtFbSender.h> // frame buffer info for message to downstream
+#include <moonray/grid/engine_tool/McrtVecSender.h> // vector line info for message to downstream
 #include <moonray/rendering/rndr/RenderContext.h>
 #include <moonray/rendering/rndr/RenderOptions.h>
+#include <moonray/rendering/rndr/Types.h>
 #include <scene_rdl2/common/grid_util/Arg.h>
 #include <scene_rdl2/common/grid_util/Fb.h>
 #include <scene_rdl2/common/grid_util/Parser.h>
 #include <scene_rdl2/common/math/Viewport.h>
 
 #include <atomic>
+
+#include <cmath> // NAN
 #include <condition_variable>
 #include <mutex>
 #include <thread>
@@ -161,15 +164,23 @@ public:
     using StopFrameCallBack = std::function<void(const std::string &soruce)>;
     using GetTimingRecFrameCallBack = std::function<TimingRecorder::TimingRecorderSingleFrameShPtr()>;
 
+    enum class PathVisGenLineCondition : int { NO_GENLINE, WAIT_RENDERPREP_FINISHED, RUN_GENLINE };
+
     // Non-copyable
-    RenderContextDriver &operator =(const RenderContextDriver) = delete;
-    RenderContextDriver(const RenderContextDriver &) = delete;
+    RenderContextDriver& operator =(const RenderContextDriver) = delete;
+    RenderContextDriver(const RenderContextDriver&) = delete;
 
     RenderContextDriver(const RenderContextDriverOptions& options,
                         RenderContextDestructionManager* renderContextDestructionManager);
     ~RenderContextDriver();
 
     int getDriverId() const { return mDriverId; }
+    bool isPathVisualizerMode();
+    bool needToRunGenLine() { return mGenLineCondition == PathVisGenLineCondition::RUN_GENLINE; }
+    void resetGenLine() { mGenLineCondition = PathVisGenLineCondition::NO_GENLINE; }
+    void revertRenderMode();
+    static std::string showMat4f(const scene_rdl2::math::Mat4f& mtx);
+    static std::string showRenderMode(const moonray::rndr::RenderMode mode);
 
     void start(); // start renderContextDriver main function. should be public for testing purpose
     
@@ -194,10 +205,10 @@ public:
     void evalPickMessage(const arras4::api::Message &msg, EvalPickSendMsgCallBack sendCallBack);
     void evalProgressiveFeedbackMessage(const arras4::api::Message& msg);
 
-    void evalMultiMachineGlobalProgressUpdate(unsigned currSyncId, float fraction);
-    void evalRenderCompleteMultiMachine(unsigned currSyncId);
+    void evalMultiMachineGlobalProgressUpdate(const unsigned currSyncId, const float fraction);
+    void evalRenderCompleteMultiMachine(const unsigned currSyncId);
 
-    void setReceivedSnapshotRequest(bool flag) { mReceivedSnapshotRequest = flag; }
+    void setReceivedSnapshotRequest(const bool flag) { mReceivedSnapshotRequest = flag; }
 
     //------------------------------
     //
@@ -222,6 +233,11 @@ public:
 
     //------------------------------
 
+    moonray::rndr::RenderContext *getRenderContext();
+
+    void startFramePublic() { startFrame(); }
+    void stopFramePublic() { stopFrame(); }
+
     std::string show() const;
 
 private:
@@ -234,12 +250,11 @@ private:
 
     //------------------------------
 
-    moonray::rndr::RenderContext *getRenderContext();
-    moonray::rndr::RenderContext *resetRenderContext(); // rm old then create new RenderContext
-    scene_rdl2::rdl2::SceneContext *getSceneContextBackup();
-    scene_rdl2::rdl2::SceneContext *resetSceneContextBackup(); // rm old then create new SceneContextBackup
-    static void updateSceneContextBackup(scene_rdl2::rdl2::SceneContext *sceneContext,
-                                         const std::string &manifest, const std::string &payload);
+    moonray::rndr::RenderContext* resetRenderContext(); // rm old then create new RenderContext
+    scene_rdl2::rdl2::SceneContext* getSceneContextBackup();
+    scene_rdl2::rdl2::SceneContext* resetSceneContextBackup(); // rm old then create new SceneContextBackup
+    static void updateSceneContextBackup(scene_rdl2::rdl2::SceneContext* sceneContext,
+                                         const std::string& manifest, const std::string& payload);
 
     bool renderPrepMain();      // return true:OK false:canceled
     void heartBeatMain();
@@ -253,15 +268,15 @@ private:
 
     //------------------------------
 
-    void processRdlMessage(const MessageContentConstPtr &msg,
+    void processRdlMessage(const MessageContentConstPtr& msg,
                            arras4::api::ObjectConstRef src);
-    void processRenderSetupMessage(const MessageContentConstPtr &msg,
+    void processRenderSetupMessage(const MessageContentConstPtr& msg,
                                    arras4::api::ObjectConstRef src);
-    void processROIMessage(const MessageContentConstPtr &msg,
+    void processROIMessage(const MessageContentConstPtr& msg,
                            arras4::api::ObjectConstRef src);
-    void processViewportMessage(const MessageContentConstPtr &msg,
+    void processViewportMessage(const MessageContentConstPtr& msg,
                                 arras4::api::ObjectConstRef src);
-    void processRenderControlStartMessage(const MessageContentConstPtr &msg,
+    void processRenderControlStartMessage(const MessageContentConstPtr& msg,
                                           arras4::api::ObjectConstRef src);
 
     void initializeBuffers();
@@ -272,22 +287,23 @@ private:
 
     void handlePick(const uint32_t syncId,
                     const mcrt::RenderMessages::PickMode mode, const int x, const int y,
-                    mcrt::JSONMessage::Ptr &result);
+                    mcrt::JSONMessage::Ptr& result);
 
     //------------------------------
 
     void debugCommandParserConfigure();
-    bool debugCommandRenderContext(Arg &arg);
+    bool debugCommandRenderContext(Arg& arg);
 
     //------------------------------
 
     void startFrame();
+    bool computeOrbitCamAutoFocusPoint(scene_rdl2::math::Vec3f& focusPoint);
     
     // stopFrame and return status which is just before stopFrame oepration
     // return true : renderContext was rendering condition
     //        false : renderContext was stop condition
     bool stopFrame();
-    void requestStopAtPassBoundary(uint32_t syncId);
+    void requestStopAtPassBoundary(const uint32_t syncId);
 
     void reconstructSceneFromBackup(); // internally creates new RenderContext
 
@@ -313,15 +329,16 @@ private:
     void updateInfoData(std::vector<std::string>& infoDataArray);
     void updateExecModeMcrtNodeInfo();
     void updateNetIO();
+    void updateOrbitCamAutoFocusPoint();
     void piggyBackStatsInfo(std::vector<std::string>& infoDataArray);
     void piggyBackTimingRec(std::vector<std::string>& infoDataArray);
-    mcrt::BaseFrame::ImageEncoding encoTypeConvert(EncodingType enco) const;
+    mcrt::BaseFrame::ImageEncoding encoTypeConvert(const EncodingType enco) const;
     void applyConfigOverrides();
 
     //------------------------------
 
-    void setFeedbackActive(bool flag);
-    void setFeedbackIntervalSec(float sec);
+    void setFeedbackActive(const bool flag);
+    void setFeedbackIntervalSec(const float sec);
     void feedbackFbViewportCheck(ProgressiveFeedbackConstPtr feedbackMsg);
     void decodeFeedbackImageData(ProgressiveFeedbackConstPtr feedbackMsg);
     bool decodeMergeActionTracker(ProgressiveFeedbackConstPtr feedbackMsg);
@@ -369,6 +386,14 @@ private:
     std::unique_ptr<scene_rdl2::rdl2::SceneContext> mSceneContextBackup {nullptr};
 
     moonray::engine_tool::McrtFbSender mFbSender;
+    moonray::engine_tool::McrtVecSender mVecSender;
+
+    scene_rdl2::math::Mat4f mPathVisCamXform;
+    scene_rdl2::math::Mat4f mLastCurrInteractiveCamXform;
+    moonray::rndr::RenderMode mLastRenderModeBeforeSimStage { moonray::rndr::RenderMode::PROGRESSIVE };
+
+    // PathVisualizer generate line condition
+    PathVisGenLineCondition mGenLineCondition { PathVisGenLineCondition::NO_GENLINE };
 
     //------------------------------
     //
@@ -410,6 +435,9 @@ private:
     float mInitFrameDelayedSnapshotStepMS {6.25f}; // each host delay offset by millisec.
     double mInitFrameDelayedSnapshotSec {-1.0};
 
+    scene_rdl2::math::Vec3f mOrbitCamAutoFocusPoint {NAN, NAN, NAN};
+    scene_rdl2::math::Vec3f mOrbitCamAutoFocusPointLastSent {NAN, NAN, NAN};
+
     //------------------------------
     //
     // Flags and counters which we are using to track particular conditions.
@@ -428,6 +456,11 @@ private:
 
     int mRenderCounter {0}; // rendering action (= render start) counter from process started
     int mRenderCounterLastSnapshot {0}; // rendering action counter at last snapshot
+
+    uint32_t mPathVisSimModeCounter {0}; // total count of PathVisualizer sim run from process start. Never reset to 0
+    uint32_t mPathVisSimModeCounterLastUpdate {0}; // counter when last updated the PathVisData to the client
+    uint32_t mPathVisRenderCounterLastUpdate {0};
+    uint32_t mPathVisLastSentTotalLines {0};
 
     double mInitialSnapshotReadyTime {0.0}; // initial snapshot ready time for new frame
     bool mBeforeInitialSnapshot {false}; // In order to track the very first snapshot data of the new frame.

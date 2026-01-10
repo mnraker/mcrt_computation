@@ -1,6 +1,5 @@
-// Copyright 2023-2024 DreamWorks Animation LLC
+// Copyright 2023-2025 DreamWorks Animation LLC
 // SPDX-License-Identifier: Apache-2.0
-
 #include "RenderContextDriver.h"
 #include "RenderContextDestructionManager.h"
 
@@ -9,6 +8,7 @@
 #include <mcrt_dataio/share/util/MiscUtil.h>
 #include <mcrt_dataio/share/util/SysUsage.h>
 #include <mcrt_messages/RDLMessage.h>
+#include <moonray/rendering/rndr/PathVisualizerManager.h>
 #include <scene_rdl2/common/rec_time/RecTime.h>
 
 #include <iostream>
@@ -54,6 +54,9 @@ RenderContextDriver::RenderContextDriver(const RenderContextDriverOptions& optio
 
     mFbSender.setMachineId(mMachineIdOverride);
 
+    unsigned totalMachines = (mNumMachinesOverride < 0) ? 1 : static_cast<unsigned>(mNumMachinesOverride);
+    mVecSender.setMachineTotalAndId(totalMachines, static_cast<unsigned>(mMachineIdOverride));
+
     mMcrtNodeInfoMapItem.getMcrtNodeInfo().setHostName(mcrt_dataio::MiscUtil::getHostName());
     mMcrtNodeInfoMapItem.getMcrtNodeInfo().setCpuTotal(mcrt_dataio::SysUsage::getCpuTotal());
     mMcrtNodeInfoMapItem.getMcrtNodeInfo().setAssignedCpuTotal(mRenderOptions.getThreads());
@@ -94,6 +97,13 @@ RenderContextDriver::~RenderContextDriver()
     if (mRenderContext) delete mRenderContext;
 }
 
+bool
+RenderContextDriver::isPathVisualizerMode()
+{
+    moonray::rndr::PathVisualizerManager* visMgrObsrPtr = getRenderContext()->getPathVisualizerManager().get();
+    return visMgrObsrPtr->isOn();
+}
+
 void
 RenderContextDriver::start()
 //
@@ -116,6 +126,15 @@ RenderContextDriver::start()
 
 //------------------------------------------------------------------------------------------
 
+moonray::rndr::RenderContext *
+RenderContextDriver::getRenderContext()
+{
+    if (!mRenderContext) {
+        return resetRenderContext();
+    }
+    return mRenderContext;
+}
+
 std::string
 RenderContextDriver::show() const
 {
@@ -130,15 +149,6 @@ RenderContextDriver::show() const
 
 //------------------------------------------------------------------------------------------
 //------------------------------------------------------------------------------------------
-
-moonray::rndr::RenderContext *
-RenderContextDriver::getRenderContext()
-{
-    if (!mRenderContext) {
-        return resetRenderContext();
-    }
-    return mRenderContext;
-}
 
 moonray::rndr::RenderContext *
 RenderContextDriver::resetRenderContext()
@@ -230,7 +240,27 @@ RenderContextDriver::renderPrepMain()
 #endif // end DEBUG_MSG_RENDERPREPMAIN
     McrtTimeStamp("startFrame {", "start startFrame");
 
-    moonray::rndr::RenderContext::RP_RESULT flag = mRenderContext->startFrame();
+    bool simulationMode = false;
+    if (isPathVisualizerMode()) {
+        moonray::rndr::PathVisualizerManager* visMgrObsrPtr = mRenderContext->getPathVisualizerManager().get();
+        if (visMgrObsrPtr->isInRecordState()) { // simulation mode rendering
+            simulationMode = true;
+            mLastRenderModeBeforeSimStage = mRenderOptions.getRenderMode();
+            mRenderOptions.setRenderMode(moonray::rndr::RenderMode::PROGRESSIVE);
+            mPathVisSimModeCounter++; // counter increment
+            /* for debug
+            std::cerr << ">> RenderContextDriver.cc simStage renderMode to "
+                      << showRenderMode(mRenderOptions.getRenderMode()) << '\n';
+            */
+        } else {
+            mGenLineCondition = PathVisGenLineCondition::WAIT_RENDERPREP_FINISHED;
+        }
+    }
+
+    //------------------------------
+    // startFrame
+    //------------------------------
+    moonray::rndr::RenderContext::RP_RESULT flag = mRenderContext->startFrame(simulationMode);
     mLastTimeRenderPrepResult = flag; // update last renderPrep result 
 
 #ifdef DEBUG_MSG_RENDERPREPMAIN
